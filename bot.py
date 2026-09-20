@@ -87,10 +87,33 @@ def structure(candles):
     if last < lo3: return "BEAR_CHOCH"
     return "RANGE"
 
-def liquidity_sweep(candles, side):
-    if len(candles) < 15: return False
-    h,l,c=highs(candles),lows(candles),closes(candles); hi,lo=max(h[-14:-2]),min(l[-14:-2])
-    return (l[-2] < lo and c[-2] > lo) if side=="LONG" else (h[-2] > hi and c[-2] < hi)
+def liquidity_sweep(candles, side, lookback=10, swing=5):
+    """Find a recent SSL/BSL sweep on completed candles.
+    LONG: candle takes a prior swing low and closes back above it (SSL).
+    SHORT: candle takes a prior swing high and closes back below it (BSL).
+    We inspect several recent completed candles instead of only [-2], so a
+    sweep that happened 1-5 candles ago is still available for the next stages.
+    """
+    if len(candles) < swing + lookback + 3:
+        return False, None
+    h,l,c=highs(candles),lows(candles),closes(candles)
+    # Ignore the currently forming candle; inspect the last `lookback` completed candles.
+    end = len(candles) - 1
+    start = max(swing + 1, end - lookback)
+    for i in range(end - 1, start - 1, -1):
+        left=max(0, i-swing)
+        right=min(i, i+swing)
+        if side=="LONG":
+            prior_low=min(l[left:i])
+            # SSL: wick below prior lows, then close back above that liquidity.
+            if l[i] < prior_low and c[i] > prior_low:
+                return True, {"type":"SSL", "index":i, "level":prior_low, "low":l[i], "close":c[i]}
+        else:
+            prior_high=max(h[left:i])
+            # BSL: wick above prior highs, then close back below that liquidity.
+            if h[i] > prior_high and c[i] < prior_high:
+                return True, {"type":"BSL", "index":i, "level":prior_high, "high":h[i], "close":c[i]}
+    return False, None
 
 def fvg(candles, side):
     if len(candles) < 5: return False
@@ -137,11 +160,13 @@ def signal(symbol):
         else:
             logging.info("%s | STEP 4 | 15m structure opposite (%s) | continue for sweep/reversal evidence",symbol,st)
 
-        sweep=liquidity_sweep(d15,side)
+        sweep, sweep_info=liquidity_sweep(d15,side)
         logging.info("%s | STEP 5 | 15m liquidity sweep=%s",symbol,sweep)
         if sweep:
             score += 2
+            logging.info("%s | STEP 5 | %s sweep | level=%.8g | extreme=%.8g | close=%.8g", symbol, sweep_info["type"], sweep_info["level"], sweep_info.get("low", sweep_info.get("high")), sweep_info["close"])
         else:
+            logging.info("%s | STEP 5 | no recent %s sweep in last 10 completed 15m candles",symbol,"SSL" if side=="LONG" else "BSL")
             logging.info("%s | WAIT %s | no 15m liquidity sweep | score=%d/10",symbol,side,score); return None
 
         has_fvg=fvg(d10,side)
