@@ -118,18 +118,56 @@ def signal(symbol):
             logging.info("%s | WAIT | candles: 1H=%d 15m=%d 10m=%d 5m=%d",symbol,*lens); return None
         b,st=bias(d1),structure(d15)
         logging.info("%s | STEP 3 | 1H=%s | 15m=%s",symbol,b,st)
-        if b=="LONG" and st in ("BULL_BOS","BULL_CHOCH"): side="LONG"
-        elif b=="SHORT" and st in ("BEAR_BOS","BEAR_CHOCH"): side="SHORT"
+        if b not in ("LONG","SHORT"):
+            logging.info("%s | WAIT | 1H has no clear direction",symbol); return None
+
+        # 1H is the primary directional filter. Do NOT reject RANGE on 15m:
+        # a liquidity sweep can happen while 15m is still ranging, which is
+        # exactly the pattern V6 is designed to catch.
+        side=b
+        score=0
+        score += 2
+        logging.info("%s | STEP 4 | candidate=%s | 1H direction PASS (+2)",symbol,side)
+
+        if st in (("BULL_BOS","BULL_CHOCH") if side=="LONG" else ("BEAR_BOS","BEAR_CHOCH")):
+            score += 2
+            logging.info("%s | STEP 4 | 15m structure aligned PASS (+2)",symbol)
+        elif st == "RANGE":
+            logging.info("%s | STEP 4 | 15m RANGE | continue searching liquidity",symbol)
         else:
-            logging.info("%s | WAIT | direction/structure mismatch",symbol); return None
-        if not liquidity_sweep(d15,side): logging.info("%s | WAIT %s | no 15m liquidity sweep",symbol,side); return None
-        logging.info("%s | PASS | 15m liquidity sweep",symbol)
-        if not fvg(d10,side): logging.info("%s | WAIT %s | no 10m FVG",symbol,side); return None
-        logging.info("%s | PASS | 10m FVG",symbol)
-        if not retest(d10,side): logging.info("%s | WAIT %s | no 10m retest",symbol,side); return None
-        logging.info("%s | PASS | 10m retest",symbol)
-        if not trigger(d5,side): logging.info("%s | WAIT %s | no 5m confirmation",symbol,side); return None
-        logging.info("%s | PASS | 5m confirmation",symbol)
+            logging.info("%s | STEP 4 | 15m structure opposite (%s) | continue for sweep/reversal evidence",symbol,st)
+
+        sweep=liquidity_sweep(d15,side)
+        logging.info("%s | STEP 5 | 15m liquidity sweep=%s",symbol,sweep)
+        if sweep:
+            score += 2
+        else:
+            logging.info("%s | WAIT %s | no 15m liquidity sweep | score=%d/10",symbol,side,score); return None
+
+        has_fvg=fvg(d10,side)
+        logging.info("%s | STEP 6 | 10m FVG/IMBALANCE=%s",symbol,has_fvg)
+        if has_fvg:
+            score += 2
+        else:
+            logging.info("%s | WAIT %s | no 10m FVG | score=%d/10",symbol,side,score); return None
+
+        has_retest=retest(d10,side)
+        logging.info("%s | STEP 7 | 10m RETEST=%s",symbol,has_retest)
+        if has_retest:
+            score += 1
+        else:
+            logging.info("%s | WAIT %s | no 10m retest | score=%d/10",symbol,side,score); return None
+
+        has_trigger=trigger(d5,side)
+        logging.info("%s | STEP 8 | 5m CONFIRMATION=%s",symbol,has_trigger)
+        if has_trigger:
+            score += 1
+        else:
+            logging.info("%s | WAIT %s | no 5m confirmation | score=%d/10",symbol,side,score); return None
+
+        logging.info("%s | STEP 9 | FINAL SCORE=%d/10 | minimum=%d",symbol,score,MIN_SCORE)
+        if score < MIN_SCORE:
+            logging.info("%s | WAIT | score below minimum",symbol); return None
         price,a=closes(d5)[-2],atr(d5)
         if not math.isfinite(a) or a<=0: logging.info("%s | WAIT | invalid ATR",symbol); return None
         h,l=highs(d5),lows(d5)
@@ -141,8 +179,8 @@ def signal(symbol):
             sl=max(h[-12:])+.25*a; risk=sl-price
             if risk<=0:return None
             el,eh=price-.05*a,price+.20*a; tp1,tp2=price-risk,price-risk*RR
-        logging.info("%s | SIGNAL READY | %s | score=10",symbol,side)
-        return side,symbol,10,min(el,eh),max(el,eh),sl,tp1,tp2,f"1H={b} | 15m={st} | liquidity sweep | 10m FVG/imbalance | 10m retest | 5m confirmation"
+        logging.info("%s | SIGNAL READY | %s | score=%d",symbol,side,score)
+        return side,symbol,score,min(el,eh),max(el,eh),sl,tp1,tp2,f"1H={b} | 15m={st} | liquidity sweep | 10m FVG/imbalance | 10m retest | 5m confirmation"
     except Exception as e:
         logging.exception("%s | ERROR during scan: %s",symbol,e); return None
 
