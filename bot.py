@@ -40,11 +40,32 @@ def fetch(symbol, timeframe, limit=80):
     return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 def build_10m_from_5m(symbol, limit=80):
-    raw = fetch(symbol, "5m", limit * 2 + 4); result = []
-    for i in range(0, len(raw)-1, 2):
-        a, b = raw[i], raw[i+1]
-        if int(a[0]) // 600000 != int(b[0]) // 600000: continue
-        result.append([a[0], float(a[1]), max(float(a[2]),float(b[2])), min(float(a[3]),float(b[3])), float(b[4]), float(a[5])+float(b[5])])
+    # MEXC does not reliably provide native 10m candles, so build them
+    # from 5m candles using real UTC 10-minute buckets: 00, 10, 20, 30, 40, 50.
+    raw = fetch(symbol, "5m", limit * 2 + 12)
+    buckets = {}
+    for row in raw:
+        ts = int(row[0])
+        bucket_ts = (ts // 600000) * 600000
+        buckets.setdefault(bucket_ts, []).append(row)
+
+    result = []
+    for bucket_ts in sorted(buckets):
+        rows = sorted(buckets[bucket_ts], key=lambda x: int(x[0]))
+        # Only use complete 10m candles: exactly two consecutive 5m candles.
+        if len(rows) < 2:
+            continue
+        a, b = rows[0], rows[1]
+        if int(b[0]) - int(a[0]) != 300000:
+            continue
+        result.append([
+            bucket_ts,
+            float(a[1]),
+            max(float(a[2]), float(b[2])),
+            min(float(a[3]), float(b[3])),
+            float(b[4]),
+            float(a[5]) + float(b[5]),
+        ])
     return result[-limit:]
 
 def bias(candles):
