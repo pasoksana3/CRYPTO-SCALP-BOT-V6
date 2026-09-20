@@ -1,243 +1,97 @@
-import os
-import time
-import math
-import logging
-import requests
-import ccxt
+import os,time,logging,ccxt,requests
+logging.basicConfig(level=logging.INFO,format="%(asctime)s | V6.3 | %(levelname)s | %(message)s")
+log=logging.getLogger("v6")
+SYMBOLS=[x.strip() for x in os.getenv("SYMBOLS","BTC/USDT:USDT,ETH/USDT:USDT,NEAR/USDT:USDT,PYTH/USDT:USDT,ADA/USDT:USDT,ENA/USDT:USDT").split(",") if x.strip()]
+POLL_SECONDS=int(os.getenv("POLL_SECONDS","60")); LEVERAGE=int(os.getenv("LEVERAGE","30")); RR=float(os.getenv("RR","2")); MIN_SCORE=int(os.getenv("MIN_SCORE","7"))
+SWING_N=int(os.getenv("SWING_N","2")); SWEEP_LOOKBACK=int(os.getenv("SWEEP_LOOKBACK","30"))
+TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN",""); TG_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID","")
+exchange=ccxt.mexc({"apiKey":os.getenv("MEXC_API_KEY",""),"secret":os.getenv("MEXC_SECRET",""),"enableRateLimit":True,"options":{"defaultType":"swap"}})
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | V6 | %(levelname)s | %(message)s")
-
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,NEAR/USDT:USDT,PYTH/USDT:USDT,ADA/USDT:USDT,ENA/USDT:USDT").split(",")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-LEVERAGE = int(os.getenv("LEVERAGE", "30"))
-RR = float(os.getenv("RR", "2.0"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "7"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-exchange = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-
-def closes(r): return [float(x[4]) for x in r]
-def highs(r): return [float(x[2]) for x in r]
-def lows(r): return [float(x[3]) for x in r]
-def opens(r): return [float(x[1]) for x in r]
-
-def ema(values, period):
-    if not values: return 0.0
-    k = 2 / (period + 1); value = values[0]
-    for x in values[1:]: value = x * k + value * (1 - k)
-    return value
-
-def atr(candles, period=14):
-    if len(candles) < period + 2: return 0.0
-    tr = []
-    for i in range(1, len(candles)):
-        h, l, pc = float(candles[i][2]), float(candles[i][3]), float(candles[i-1][4])
-        tr.append(max(h-l, abs(h-pc), abs(l-pc)))
-    return sum(tr[-period:]) / period
-
-def fetch(symbol, timeframe, limit=80):
-    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-def build_10m_from_5m(symbol, limit=80):
-    # MEXC does not reliably provide native 10m candles, so build them
-    # from 5m candles using real UTC 10-minute buckets: 00, 10, 20, 30, 40, 50.
-    raw = fetch(symbol, "5m", limit * 2 + 12)
-    buckets = {}
-    for row in raw:
-        ts = int(row[0])
-        bucket_ts = (ts // 600000) * 600000
-        buckets.setdefault(bucket_ts, []).append(row)
-
-    result = []
-    for bucket_ts in sorted(buckets):
-        rows = sorted(buckets[bucket_ts], key=lambda x: int(x[0]))
-        # Only use complete 10m candles: exactly two consecutive 5m candles.
-        if len(rows) < 2:
-            continue
-        a, b = rows[0], rows[1]
-        if int(b[0]) - int(a[0]) != 300000:
-            continue
-        result.append([
-            bucket_ts,
-            float(a[1]),
-            max(float(a[2]), float(b[2])),
-            min(float(a[3]), float(b[3])),
-            float(b[4]),
-            float(a[5]) + float(b[5]),
-        ])
-    return result[-limit:]
-
-def bias(candles):
-    v = closes(candles)
-    if len(v) < 55: return "NEUTRAL"
-    e20, e50, last = ema(v[:-1],20), ema(v[:-1],50), v[-2]
-    if last > e20 > e50: return "LONG"
-    if last < e20 < e50: return "SHORT"
-    return "NEUTRAL"
-
-def structure(candles):
-    if len(candles) < 12: return "RANGE"
-    c,h,l = closes(candles),highs(candles),lows(candles); last=c[-2]
-    hi,lo=max(h[-8:-2]),min(l[-8:-2])
-    if last > hi: return "BULL_BOS"
-    if last < lo: return "BEAR_BOS"
-    hi3,lo3=max(h[-5:-2]),min(l[-5:-2])
-    if last > hi3: return "BULL_CHOCH"
-    if last < lo3: return "BEAR_CHOCH"
-    return "RANGE"
-
-def liquidity_sweep(candles, side, lookback=10, swing=5):
-    """Find a recent SSL/BSL sweep on completed candles.
-    LONG: candle takes a prior swing low and closes back above it (SSL).
-    SHORT: candle takes a prior swing high and closes back below it (BSL).
-    We inspect several recent completed candles instead of only [-2], so a
-    sweep that happened 1-5 candles ago is still available for the next stages.
-    """
-    if len(candles) < swing + lookback + 3:
-        return False, None
-    h,l,c=highs(candles),lows(candles),closes(candles)
-    # Ignore the currently forming candle; inspect the last `lookback` completed candles.
-    end = len(candles) - 1
-    start = max(swing + 1, end - lookback)
-    for i in range(end - 1, start - 1, -1):
-        left=max(0, i-swing)
-        right=min(i, i+swing)
-        if side=="LONG":
-            prior_low=min(l[left:i])
-            # SSL: wick below prior lows, then close back above that liquidity.
-            if l[i] < prior_low and c[i] > prior_low:
-                return True, {"type":"SSL", "index":i, "level":prior_low, "low":l[i], "close":c[i]}
-        else:
-            prior_high=max(h[left:i])
-            # BSL: wick above prior highs, then close back below that liquidity.
-            if h[i] > prior_high and c[i] < prior_high:
-                return True, {"type":"BSL", "index":i, "level":prior_high, "high":h[i], "close":c[i]}
-    return False, None
-
-def fvg(candles, side):
-    if len(candles) < 5: return False
-    h,l=highs(candles),lows(candles)
-    return l[-2] > h[-4] if side=="LONG" else h[-2] < l[-4]
-
-def retest(candles, side):
-    if len(candles) < 7: return False
-    o,c,h,l=opens(candles),closes(candles),highs(candles),lows(candles)
-    return (l[-3] <= h[-5] and c[-3] > o[-3]) if side=="LONG" else (h[-3] >= l[-5] and c[-3] < o[-3])
-
-def trigger(candles, side):
-    if len(candles) < 5: return False
-    o,c,h,l=opens(candles),closes(candles),highs(candles),lows(candles)
-    return (c[-2] > o[-2] and c[-2] > h[-3] and l[-2] <= l[-3]) if side=="LONG" else (c[-2] < o[-2] and c[-2] < l[-3] and h[-2] >= h[-3])
-
-def signal(symbol):
+def tg(s):
+    if TG_TOKEN and TG_CHAT_ID:
+        try: requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",data={"chat_id":TG_CHAT_ID,"text":s},timeout=10).raise_for_status()
+        except Exception as e: log.warning("Telegram error: %s",e)
+def fetch(sym,tf,n=200): return exchange.fetch_ohlcv(sym,timeframe=tf,limit=n)
+def build10(rows):
+    b={}
+    for r in rows: b.setdefault((r[0]//600000)*600000,[]).append(r)
+    out=[]
+    for ts,rs in sorted(b.items()):
+        rs=sorted(rs)[-2:]
+        if len(rs)==2: out.append([ts,rs[0][1],max(x[2] for x in rs),min(x[3] for x in rs),rs[-1][4],sum(x[5] for x in rs)])
+    return out
+def d1(rows):
+    c=[r[4] for r in rows[-20:]]
+    if len(c)<20:return"RANGE"
+    f=sum(c[-5:])/5;s=sum(c)/20
+    return "LONG" if f>s*1.002 else "SHORT" if f<s*.998 else "RANGE"
+def s15(rows):
+    if len(rows)<8:return"RANGE"
+    a=rows[-6:-2];b=rows[-2:]
+    ah=max(x[2] for x in a);al=min(x[3] for x in a);bh=max(x[2] for x in b);bl=min(x[3] for x in b)
+    return "LONG" if bh>ah and bl>=al else "SHORT" if bl<al and bh<=ah else "RANGE"
+def slocal(rows,i,n):
+    return i>=n and i+n<len(rows) and all(rows[i][3]<rows[j][3] for j in range(i-n,i+n+1) if j!=i)
+def hlocal(rows,i,n):
+    return i>=n and i+n<len(rows) and all(rows[i][2]>rows[j][2] for j in range(i-n,i+n+1) if j!=i)
+def sweep(rows,cand):
+    r=rows[:-1]
+    start=max(SWING_N,len(r)-SWEEP_LOOKBACK-SWING_N); end=len(r)-SWING_N-1
+    if cand=="LONG":
+        swings=[(i,r[i][3]) for i in range(start,end+1) if slocal(r,i,SWING_N)]
+        if not swings: log.info("STEP 5 | no local swing low found"); return False,None
+        for i,lev in reversed(swings):
+            for j in range(i+SWING_N+1,len(r)):
+                if r[j][3]<lev and r[j][4]>lev:
+                    return True,{"type":"SSL","level":lev,"extreme":r[j][3],"close":r[j][4]}
+        log.info("STEP 5 | swing low=%.8f | current low=%.8f | close=%.8f",swings[-1][1],min(x[3] for x in r[-5:]),r[-1][4])
+        return False,None
+    swings=[(i,r[i][2]) for i in range(start,end+1) if hlocal(r,i,SWING_N)]
+    if not swings: log.info("STEP 5 | no local swing high found"); return False,None
+    for i,lev in reversed(swings):
+        for j in range(i+SWING_N+1,len(r)):
+            if r[j][2]>lev and r[j][4]<lev:
+                return True,{"type":"BSL","level":lev,"extreme":r[j][2],"close":r[j][4]}
+    log.info("STEP 5 | swing high=%.8f | current high=%.8f | close=%.8f",swings[-1][1],max(x[2] for x in r[-5:]),r[-1][4])
+    return False,None
+def fvg(r,c):
+    if len(r)<4:return False
+    a=r[-4];x=r[-2]
+    return x[3]>a[2] if c=="LONG" else x[2]<a[3]
+def retest(r,c):
+    if len(r)<4:return False
+    a=r[-3];x=r[-2]
+    return (x[4]>a[4] and x[3]<=a[4]) if c=="LONG" else (x[4]<a[4] and x[2]>=a[4])
+def confirm(r,c):
+    if len(r)<4:return False
+    a=r[-3];x=r[-2]
+    return (x[4]>x[1] and x[4]>a[4]) if c=="LONG" else (x[4]<x[1] and x[4]<a[4])
+def scan(sym):
     try:
-        logging.info("%s | STEP 1 | fetching 1H + 15m + 5m", symbol)
-        d1,d15,d5=fetch(symbol,"1h"),fetch(symbol,"15m"),fetch(symbol,"5m")
-        logging.info("%s | STEP 2 | building 10m from 5m", symbol)
-        d10=build_10m_from_5m(symbol)
-        lens=(len(d1),len(d15),len(d10),len(d5))
-        if min(lens)<20:
-            logging.info("%s | WAIT | candles: 1H=%d 15m=%d 10m=%d 5m=%d",symbol,*lens); return None
-        b,st=bias(d1),structure(d15)
-        logging.info("%s | STEP 3 | 1H=%s | 15m=%s",symbol,b,st)
-        if b not in ("LONG","SHORT"):
-            logging.info("%s | WAIT | 1H has no clear direction",symbol); return None
-
-        # 1H is the primary directional filter. Do NOT reject RANGE on 15m:
-        # a liquidity sweep can happen while 15m is still ranging, which is
-        # exactly the pattern V6 is designed to catch.
-        side=b
-        score=0
-        score += 2
-        logging.info("%s | STEP 4 | candidate=%s | 1H direction PASS (+2)",symbol,side)
-
-        if st in (("BULL_BOS","BULL_CHOCH") if side=="LONG" else ("BEAR_BOS","BEAR_CHOCH")):
-            score += 2
-            logging.info("%s | STEP 4 | 15m structure aligned PASS (+2)",symbol)
-        elif st == "RANGE":
-            logging.info("%s | STEP 4 | 15m RANGE | continue searching liquidity",symbol)
-        else:
-            logging.info("%s | STEP 4 | 15m structure opposite (%s) | continue for sweep/reversal evidence",symbol,st)
-
-        sweep, sweep_info=liquidity_sweep(d15,side)
-        logging.info("%s | STEP 5 | 15m liquidity sweep=%s",symbol,sweep)
-        if sweep:
-            score += 2
-            logging.info("%s | STEP 5 | %s sweep | level=%.8g | extreme=%.8g | close=%.8g", symbol, sweep_info["type"], sweep_info["level"], sweep_info.get("low", sweep_info.get("high")), sweep_info["close"])
-        else:
-            logging.info("%s | STEP 5 | no recent %s sweep in last 10 completed 15m candles",symbol,"SSL" if side=="LONG" else "BSL")
-            logging.info("%s | WAIT %s | no 15m liquidity sweep | score=%d/10",symbol,side,score); return None
-
-        has_fvg=fvg(d10,side)
-        logging.info("%s | STEP 6 | 10m FVG/IMBALANCE=%s",symbol,has_fvg)
-        if has_fvg:
-            score += 2
-        else:
-            logging.info("%s | WAIT %s | no 10m FVG | score=%d/10",symbol,side,score); return None
-
-        has_retest=retest(d10,side)
-        logging.info("%s | STEP 7 | 10m RETEST=%s",symbol,has_retest)
-        if has_retest:
-            score += 1
-        else:
-            logging.info("%s | WAIT %s | no 10m retest | score=%d/10",symbol,side,score); return None
-
-        has_trigger=trigger(d5,side)
-        logging.info("%s | STEP 8 | 5m CONFIRMATION=%s",symbol,has_trigger)
-        if has_trigger:
-            score += 1
-        else:
-            logging.info("%s | WAIT %s | no 5m confirmation | score=%d/10",symbol,side,score); return None
-
-        logging.info("%s | STEP 9 | FINAL SCORE=%d/10 | minimum=%d",symbol,score,MIN_SCORE)
-        if score < MIN_SCORE:
-            logging.info("%s | WAIT | score below minimum",symbol); return None
-        price,a=closes(d5)[-2],atr(d5)
-        if not math.isfinite(a) or a<=0: logging.info("%s | WAIT | invalid ATR",symbol); return None
-        h,l=highs(d5),lows(d5)
-        if side=="LONG":
-            sl=min(l[-12:])-.25*a; risk=price-sl
-            if risk<=0:return None
-            el,eh=price-.20*a,price+.05*a; tp1,tp2=price+risk,price+risk*RR
-        else:
-            sl=max(h[-12:])+.25*a; risk=sl-price
-            if risk<=0:return None
-            el,eh=price-.05*a,price+.20*a; tp1,tp2=price-risk,price-risk*RR
-        logging.info("%s | SIGNAL READY | %s | score=%d",symbol,side,score)
-        return side,symbol,score,min(el,eh),max(el,eh),sl,tp1,tp2,f"1H={b} | 15m={st} | liquidity sweep | 10m FVG/imbalance | 10m retest | 5m confirmation"
-    except Exception as e:
-        logging.exception("%s | ERROR during scan: %s",symbol,e); return None
-
-def send_telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram variables are NOT configured"); return
-    try:
-        r=requests.post("https://api.telegram.org/bot"+TELEGRAM_TOKEN+"/sendMessage",json={"chat_id":TELEGRAM_CHAT_ID,"text":text},timeout=8)
-        if r.status_code!=200: logging.warning("Telegram HTTP %s: %s",r.status_code,r.text[:300])
-    except Exception as e: logging.warning("Telegram error: %s",e)
-
+        log.info("========== SCAN %s ==========",sym)
+        h=fetch(sym,"1h",100); m=fetch(sym,"15m",120); m5=fetch(sym,"5m",240); m10=build10(m5)
+        a=d1(h); st=s15(m); log.info("%s | STEP 3 | 1H=%s | 15m=%s",sym,a,st)
+        cand=a if a in("LONG","SHORT") else st
+        score=2 if cand in("LONG","SHORT") else 0
+        if not cand: return
+        if st==cand: score+=2
+        log.info("%s | STEP 4 | candidate=%s | score=%d/10",sym,cand,score)
+        ok,info=sweep(m,cand); log.info("%s | STEP 5 | %s sweep=%s",sym,"SSL" if cand=="LONG" else "BSL",ok)
+        if not ok: log.info("%s | WAIT %s | no local swing liquidity sweep | score=%d/10",sym,cand,score); return
+        score+=2; fv=fvg(m10,cand); score+=2 if fv else 0; log.info("%s | STEP 6 | 10m FVG=%s | score=%d/10",sym,fv,score)
+        rt=retest(m10,cand); score+=rt; cf=confirm(m5,cand); score+=cf
+        log.info("%s | STEP 7 | retest=%s | STEP 8 | 5m confirmation=%s | score=%d/10",sym,rt,cf,score)
+        if score>=MIN_SCORE:
+            last=m10[-2]; price=last[4]; ex=info["extreme"]
+            if cand=="LONG": lo=min(last[3],ex); hi=max(last[4],lo); sl=lo*.998; tp=hi+(hi-sl)*RR
+            else: hi=max(last[2],ex); lo=min(last[4],hi); sl=hi*1.002; tp=lo-(sl-lo)*RR
+            msg=f'{"🟢 LONG" if cand=="LONG" else "🔴 SHORT"}\n{sym} Futures\nEntry: {lo:.8g} - {hi:.8g}\nSL: {sl:.8g}\nTP: {tp:.8g}\nLeverage: {LEVERAGE}x\nRR: {RR:.1f}\nLiquidity: {info["type"]} sweep\nV6.3'
+            log.info("%s | SIGNAL %s | score=%d/10",sym,cand,score); tg(msg)
+        else: log.info("%s | WAIT %s | score=%d/10",sym,cand,score)
+    except Exception as e: log.exception("%s | ERROR | %s",sym,e)
 def main():
-    logging.info("=== V6 DIAGNOSTIC MODE ===")
-    logging.info("SCALP V6 LIGHT started | symbols=%s",",".join(SYMBOLS))
-    logging.info("Settings | poll=%ss | leverage=%sx | RR=%.2f | min_score=%d",POLL_SECONDS,LEVERAGE,RR,MIN_SCORE)
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: logging.warning("Telegram variables are NOT configured")
-    last={}
+    log.info("=== CRYPTO SCALP BOT V6.3 ===")
     while True:
-        logging.info("========== NEW SCAN CYCLE ==========")
-        for symbol in SYMBOLS:
-            symbol=symbol.strip()
-            if not symbol: continue
-            logging.info(">>> SCANNING %s",symbol)
-            result=signal(symbol)
-            if not result: continue
-            if time.time()-last.get(symbol,0)<1800:
-                logging.info("%s | signal cooldown active",symbol); continue
-            side,symbol,score,el,eh,sl,tp1,tp2,why=result
-            icon="🟢 LONG" if side=="LONG" else "🔴 SHORT"
-            msg=(f"{icon}\nV6 SCALP — {symbol}\n\nScore: {score}/10\nEntry: {el:.8g} – {eh:.8g}\nSL: {sl:.8g}\nTP1: {tp1:.8g}\nTP2: {tp2:.8g}\nLeverage: {LEVERAGE}x\n\nCONFIRMATION:\n{why}\n\n⚠️ Це сигнал алгоритму, не гарантія результату.")
-            send_telegram(msg); logging.info("TELEGRAM SIGNAL SENT | %s",symbol); last[symbol]=time.time()
-        logging.info("========== SCAN COMPLETE | sleeping %ss ==========",POLL_SECONDS)
-        time.sleep(POLL_SECONDS)
-
-if __name__ == "__main__": main()
+        for s in SYMBOLS: scan(s)
+        log.info("========== SCAN COMPLETE | sleeping %ss ==========",POLL_SECONDS); time.sleep(POLL_SECONDS)
+if __name__=="__main__": main()
