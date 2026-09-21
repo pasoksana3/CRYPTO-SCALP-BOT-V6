@@ -12,7 +12,7 @@ TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID","")
 STATE_FILE="/tmp/v65_state.json"
 
-exchange=ccxt.mexc({"enableRateLimit":True,"options":{"defaultType":"swap"}})
+exchange=ccxt.mexc({"enableRateLimit":True,"timeout":15000,"options":{"defaultType":"swap"}})
 
 def closes(r): return [float(x[4]) for x in r]
 def opens(r): return [float(x[1]) for x in r]
@@ -131,7 +131,15 @@ def target(d,side,entry):
 
 def signal(s):
     try:
-        d1,d15,d10,d5=fetch(s,"1h"),fetch(s,"15m"),build_10m(s),fetch(s,"5m")
+        logging.info("%s | SCAN START", s)
+        d1=fetch(s,"1h")
+        logging.info("%s | 1H fetched", s)
+        d15=fetch(s,"15m")
+        logging.info("%s | 15m fetched", s)
+        d10=build_10m(s)
+        logging.info("%s | 10m built", s)
+        d5=fetch(s,"5m")
+        logging.info("%s | 5m fetched", s)
         b,st=bias_1h(d1),structure(d15)
         if b=="LONG" and st!="BEAR_BOS": side="LONG"
         elif b=="SHORT" and st!="BULL_BOS": side="SHORT"
@@ -176,12 +184,19 @@ def send(t):
 
 def main():
     logging.info("SCALP V6.5 started | CHoCH + FVG + POI")
+    logging.info("V6.5 symbols=%s | poll=%ss | leverage=%sx", ",".join(SYMBOLS), POLL_SECONDS, LEVERAGE)
     state=load_state()
     while True:
+        cycle_start=time.time()
+        logging.info("========== V6.5 SCAN CYCLE START ==========")
         for s in SYMBOLS:
             s=s.strip()
             if not s:continue
-            x=signal(s)
+            try:
+                x=signal(s)
+            except Exception as e:
+                logging.exception("%s | UNHANDLED ERROR", s)
+                x=None
             if not x or time.time()-float(state.get(s,0))<COOLDOWN_SECONDS:continue
             side,sym,el,eh,sl,tp,rr,why=x
             icon="🟢 LONG" if side=="LONG" else "🔴 SHORT"
@@ -191,6 +206,8 @@ def main():
                  f"⚠️ Алгоритмічний сигнал, не гарантія результату.")
             send(msg); logging.info("%s | SIGNAL | RR=%.2f",s,rr)
             state[s]=time.time(); save_state(state)
+        elapsed=time.time()-cycle_start
+        logging.info("========== V6.5 SCAN CYCLE COMPLETE | %.1fs | sleeping %ss ==========" , elapsed, POLL_SECONDS)
         time.sleep(POLL_SECONDS)
 
 if __name__=="__main__":main()
