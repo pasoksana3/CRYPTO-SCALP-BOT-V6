@@ -81,7 +81,7 @@ def sweep_choch(d,side):
             if not sws: continue
             sw=sws[-1]
             if l[i]>=l[sw] or c[i]<=l[sw]: continue
-            for k in range(i+1,min(len(d)-1,i+9)):
+            for k in range(i+2,min(len(d)-1,i+9)):
                 if c[k]>max(h[i+1:k]):
                     return i,k,l[i]
         else:
@@ -89,7 +89,7 @@ def sweep_choch(d,side):
             if not sws: continue
             sw=sws[-1]
             if h[i]<=h[sw] or c[i]>=h[sw]: continue
-            for k in range(i+1,min(len(d)-1,i+9)):
+            for k in range(i+2,min(len(d)-1,i+9)):
                 if c[k]<min(l[i+1:k]):
                     return i,k,h[i]
     return None
