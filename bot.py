@@ -1,128 +1,196 @@
-import os,time,logging,ccxt,requests,json
-logging.basicConfig(level=logging.INFO,format="%(asctime)s | V6.4 | %(levelname)s | %(message)s")
-log=logging.getLogger("v6")
-SYMBOLS=[x.strip() for x in os.getenv("SYMBOLS","BTC/USDT:USDT,ETH/USDT:USDT,NEAR/USDT:USDT,PYTH/USDT:USDT,ADA/USDT:USDT,ENA/USDT:USDT").split(",") if x.strip()]
+import os,time,math,json,logging,requests,ccxt
+logging.basicConfig(level=logging.INFO,format="%(asctime)s | V6.5 | %(levelname)s | %(message)s")
+
+SYMBOLS=os.getenv("SYMBOLS","BTC/USDT:USDT,ETH/USDT:USDT,NEAR/USDT:USDT,PYTH/USDT:USDT,ADA/USDT:USDT,ENA/USDT:USDT").split(",")
 POLL_SECONDS=int(os.getenv("POLL_SECONDS","60"))
 LEVERAGE=int(os.getenv("LEVERAGE","30"))
-TP_PCT=float(os.getenv("TP_PCT","0.0125"))
-SL_PCT=float(os.getenv("SL_PCT","0.006"))
+MIN_MOVE_PCT=float(os.getenv("MIN_MOVE_PCT","0.010"))
+TARGET_PCT=float(os.getenv("TARGET_PCT","0.0125"))
+MIN_RR=float(os.getenv("MIN_RR","1.5"))
 COOLDOWN_SECONDS=int(os.getenv("COOLDOWN_SECONDS","5400"))
-SWING_N=int(os.getenv("SWING_N","2"))
-SWEEP_LOOKBACK=int(os.getenv("SWEEP_LOOKBACK","30"))
-TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN",""); TG_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID","")
-exchange=ccxt.mexc({"apiKey":os.getenv("MEXC_API_KEY",""),"secret":os.getenv("MEXC_SECRET",""),"enableRateLimit":True,"options":{"defaultType":"swap"}})
-state_file="/tmp/v64_state.json"
+TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","")
+TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID","")
+STATE_FILE="/tmp/v65_state.json"
+
+exchange=ccxt.mexc({"enableRateLimit":True,"options":{"defaultType":"swap"}})
+
+def closes(r): return [float(x[4]) for x in r]
+def opens(r): return [float(x[1]) for x in r]
+def highs(r): return [float(x[2]) for x in r]
+def lows(r): return [float(x[3]) for x in r]
+
+def atr(r,p=14):
+    if len(r)<p+2:return 0.0
+    tr=[]
+    for i in range(1,len(r)):
+        h,l,pc=float(r[i][2]),float(r[i][3]),float(r[i-1][4])
+        tr.append(max(h-l,abs(h-pc),abs(l-pc)))
+    return sum(tr[-p:])/p
+
+def ema(v,p):
+    if not v:return 0.0
+    k=2/(p+1); e=v[0]
+    for x in v[1:]: e=x*k+e*(1-k)
+    return e
+
+def fetch(s,tf,limit=100): return exchange.fetch_ohlcv(s,timeframe=tf,limit=limit)
+
+def build_10m(s,limit=140):
+    raw=fetch(s,"5m",limit); out=[]; buckets={}
+    for x in raw: buckets.setdefault(int(x[0])//600000,[]).append(x)
+    for k in sorted(buckets):
+        a=buckets[k]
+        if len(a)<2: continue
+        out.append([k*600000,float(a[0][1]),max(float(x[2]) for x in a),min(float(x[3]) for x in a),float(a[-1][4]),sum(float(x[5]) for x in a)])
+    return out
+
+def closed(d): return d[:-1] if len(d)>2 else d
+
+def bias_1h(d):
+    c=closes(closed(d))
+    if len(c)<55:return "RANGE"
+    e20,e50=ema(c,20),ema(c,50); last=c[-1]
+    if last>e20>e50:return "LONG"
+    if last<e20<e50:return "SHORT"
+    return "RANGE"
+
+def swing_high(d,i,n=2):
+    h=highs(d)
+    return n<=i<len(d)-n and h[i]==max(h[i-n:i+n+1])
+
+def swing_low(d,i,n=2):
+    l=lows(d)
+    return n<=i<len(d)-n and l[i]==min(l[i-n:i+n+1])
+
+def structure(d):
+    d=closed(d)
+    if len(d)<15:return "RANGE"
+    h,l,c=highs(d),lows(d),closes(d)
+    if c[-1]>max(h[-9:-1]):return "BULL_BOS"
+    if c[-1]<min(l[-9:-1]):return "BEAR_BOS"
+    return "RANGE"
+
+def sweep_choch(d,side):
+    d=closed(d)
+    if len(d)<25:return None
+    h,l,c=highs(d),lows(d),closes(d)
+    start=max(3,len(d)-35)
+    for i in range(len(d)-3,start-1,-1):
+        if side=="LONG":
+            sws=[j for j in range(max(2,i-12),i) if swing_low(d,j)]
+            if not sws: continue
+            sw=sws[-1]
+            if l[i]>=l[sw] or c[i]<=l[sw]: continue
+            for k in range(i+1,min(len(d)-1,i+9)):
+                if c[k]>max(h[i+1:k]):
+                    return i,k,l[i]
+        else:
+            sws=[j for j in range(max(2,i-12),i) if swing_high(d,j)]
+            if not sws: continue
+            sw=sws[-1]
+            if h[i]<=h[sw] or c[i]>=h[sw]: continue
+            for k in range(i+1,min(len(d)-1,i+9)):
+                if c[k]<min(l[i+1:k]):
+                    return i,k,h[i]
+    return None
+
+def fvg_after(d,side):
+    d=closed(d)
+    h,l=highs(d),lows(d)
+    start=max(2,len(d)-20)
+    for i in range(start,len(d)):
+        if side=="LONG" and l[i]>h[i-2]: return i,h[i-2],l[i]
+        if side=="SHORT" and h[i]<l[i-2]: return i,h[i],l[i-2]
+    return None
+
+def retest(d,side,fvg):
+    if not fvg:return False
+    idx,zl,zh=fvg; d=closed(d)
+    if len(d)<=idx+1:return False
+    h,l,o,c=highs(d),lows(d),opens(d),closes(d)
+    for i in range(idx+1,len(d)):
+        if l[i]<=zh and h[i]>=zl:
+            if side=="LONG" and c[i]>o[i]: return True
+            if side=="SHORT" and c[i]<o[i]: return True
+    return False
+
+def confirm5(d,side):
+    d=closed(d)
+    if len(d)<5:return False
+    o,c,h,l=opens(d),closes(d),highs(d),lows(d); i=len(d)-1
+    if side=="LONG": return c[i]>o[i] and c[i]>h[i-1] and l[i]<=l[i-1]
+    return c[i]<o[i] and c[i]<l[i-1] and h[i]>=h[i-1]
+
+def target(d,side,entry):
+    d=closed(d); h,l=highs(d),lows(d)
+    if side=="LONG":
+        xs=[x for x in h[-40:-2] if x>entry]
+        return min(xs) if xs else entry*(1+TARGET_PCT)
+    xs=[x for x in l[-40:-2] if x<entry]
+    return max(xs) if xs else entry*(1-TARGET_PCT)
+
+def signal(s):
+    try:
+        d1,d15,d10,d5=fetch(s,"1h"),fetch(s,"15m"),build_10m(s),fetch(s,"5m")
+        b,st=bias_1h(d1),structure(d15)
+        if b=="LONG" and st!="BEAR_BOS": side="LONG"
+        elif b=="SHORT" and st!="BULL_BOS": side="SHORT"
+        else:return None
+        seq=sweep_choch(d15,side)
+        if not seq:return None
+        sweep_i,choch_i,sweep_extreme=seq
+        fv=fvg_after(d10,side)
+        if not fv or not retest(d10,side,fv) or not confirm5(d5,side):return None
+        a=atr(d5)
+        if a<=0:return None
+        _,zl,zh=fv; entry_low,entry_high=min(zl,zh),max(zl,zh)
+        width=entry_high-entry_low; maxw=closes(closed(d5))[-1]*0.004
+        if width>maxw:
+            if side=="LONG": entry_low=entry_high-maxw
+            else: entry_high=entry_low+maxw
+        if side=="LONG":
+            sl=min(sweep_extreme,entry_low)-0.15*a
+            tp=max(target(d15,side,entry_high),entry_high*(1+MIN_MOVE_PCT))
+            risk=entry_high-sl; rr=(tp-entry_high)/risk if risk>0 else 0
+        else:
+            sl=max(sweep_extreme,entry_high)+0.15*a
+            tp=min(target(d15,side,entry_low),entry_low*(1-MIN_MOVE_PCT))
+            risk=sl-entry_low; rr=(entry_low-tp)/risk if risk>0 else 0
+        if risk<=0 or rr<MIN_RR:return None
+        return side,s,entry_low,entry_high,sl,tp,rr,f"1H={b} | 15m={st} | liquidity sweep | CHoCH/BOS | IMB/FVG | POI retest | 5m confirmation"
+    except Exception as e:
+        logging.warning("%s | ERROR | %s",s,e); return None
 
 def load_state():
-    try:
-        with open(state_file) as f:return json.load(f)
+    try:return json.load(open(STATE_FILE,encoding="utf-8"))
     except:return {}
-def save_state(s):
-    try:
-        with open(state_file,"w") as f:json.dump(s,f)
-    except Exception as e:log.warning("state save error: %s",e)
-state=load_state()
 
-def tg(s):
-    if TG_TOKEN and TG_CHAT_ID:
-        try: requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",data={"chat_id":TG_CHAT_ID,"text":s},timeout=10).raise_for_status()
-        except Exception as e:log.warning("Telegram error: %s",e)
+def save_state(x):
+    try:json.dump(x,open(STATE_FILE,"w",encoding="utf-8"))
+    except:pass
 
-def fetch(sym,tf,n=200): return exchange.fetch_ohlcv(sym,timeframe=tf,limit=n)
-def build10(rows):
-    b={}
-    for r in rows:b.setdefault((r[0]//600000)*600000,[]).append(r)
-    out=[]
-    for ts,rs in sorted(b.items()):
-        rs=sorted(rs)[-2:]
-        if len(rs)==2:out.append([ts,rs[0][1],max(x[2] for x in rs),min(x[3] for x in rs),rs[-1][4],sum(x[5] for x in rs)])
-    return out
-def d1(rows):
-    c=[r[4] for r in rows[-20:]]
-    if len(c)<20:return"RANGE"
-    f=sum(c[-5:])/5;s=sum(c)/20
-    return"LONG" if f>s*1.002 else"SHORT" if f<s*.998 else"RANGE"
-def s15(rows):
-    if len(rows)<8:return"RANGE"
-    a=rows[-6:-2];b=rows[-2:]
-    ah=max(x[2] for x in a);al=min(x[3] for x in a);bh=max(x[2] for x in b);bl=min(x[3] for x in b)
-    return"LONG" if bh>ah and bl>=al else"SHORT" if bl<al and bh<=ah else"RANGE"
-def slocal(r,i,n):return i>=n and i+n<len(r) and all(r[i][3]<r[j][3] for j in range(i-n,i+n+1) if j!=i)
-def hlocal(r,i,n):return i>=n and i+n<len(r) and all(r[i][2]>r[j][2] for j in range(i-n,i+n+1) if j!=i)
-
-def sweep(rows,c):
-    r=rows[:-1];start=max(SWING_N,len(r)-SWEEP_LOOKBACK-SWING_N);end=len(r)-SWING_N-1
-    if c=="LONG":
-        swings=[(i,r[i][3]) for i in range(start,end+1) if slocal(r,i,SWING_N)]
-        for i,lev in reversed(swings):
-            for j in range(i+SWING_N+1,len(r)):
-                if r[j][3]<lev and r[j][4]>lev:return True,{"type":"SSL","level":lev,"extreme":r[j][3],"index":j}
-        return False,None
-    swings=[(i,r[i][2]) for i in range(start,end+1) if hlocal(r,i,SWING_N)]
-    for i,lev in reversed(swings):
-        for j in range(i+SWING_N+1,len(r)):
-            if r[j][2]>lev and r[j][4]<lev:return True,{"type":"BSL","level":lev,"extreme":r[j][2],"index":j}
-    return False,None
-
-def fvg(r,c):
-    if len(r)<5:return False
-    a=r[-4];x=r[-2]
-    return x[3]>a[2] if c=="LONG" else x[2]<a[3]
-def retest(r,c):
-    if len(r)<5:return False
-    a=r[-3];x=r[-2]
-    return (x[4]>a[4] and x[3]<=a[4]) if c=="LONG" else (x[4]<a[4] and x[2]>=a[4])
-def confirm(r,c):
-    if len(r)<4:return False
-    a=r[-3];x=r[-2]
-    return (x[4]>x[1] and x[4]>a[4]) if c=="LONG" else (x[4]<x[1] and x[4]<a[4])
-
-def can_signal(sym):
-    now=time.time(); last=float(state.get(sym,0))
-    if now-last<COOLDOWN_SECONDS:
-        return False,int(COOLDOWN_SECONDS-(now-last))
-    return True,0
-
-def scan(sym):
-    try:
-        log.info("========== SCAN %s ==========",sym)
-        h=fetch(sym,"1h",100);m=fetch(sym,"15m",120);m5=fetch(sym,"5m",240);m10=build10(m5)
-        a=d1(h);st=s15(m);log.info("%s | STEP 3 | 1H=%s | 15m=%s",sym,a,st)
-        if a not in("LONG","SHORT"):
-            log.info("%s | WAIT | 1H RANGE",sym);return
-        cand=a
-        # Direction conflict is a hard filter for accuracy.
-        if st in("LONG","SHORT") and st!=cand:
-            log.info("%s | WAIT %s | 15m conflicts with 1H",sym,cand);return
-        log.info("%s | STEP 4 | candidate=%s | direction aligned",sym,cand)
-        ok,info=sweep(m,cand);log.info("%s | STEP 5 | %s sweep=%s",sym,"SSL" if cand=="LONG" else"BSL",ok)
-        if not ok:return
-        fv=fvg(m10,cand);rt=retest(m10,cand);cf=confirm(m5,cand)
-        log.info("%s | STEP 6 | FVG=%s",sym,fv)
-        log.info("%s | STEP 7 | retest=%s",sym,rt)
-        log.info("%s | STEP 8 | 5m confirmation=%s",sym,cf)
-        # Accurate short-term setup: sweep + 5m confirmation + FVG OR retest.
-        valid=cf and (fv or rt)
-        log.info("%s | SETUP | sweep=%s | FVG=%s | retest=%s | 5m=%s | valid=%s",sym,ok,fv,rt,cf,valid)
-        if not valid:
-            log.info("%s | WAIT %s | incomplete confirmation",sym,cand);return
-        allowed,left=can_signal(sym)
-        if not allowed:
-            log.info("%s | COOLDOWN | %ss remaining",sym,left);return
-        price=m10[-2][4]
-        if cand=="LONG":
-            entry=price;tp=entry*(1+TP_PCT);sl=entry*(1-SL_PCT)
-        else:
-            entry=price;tp=entry*(1-TP_PCT);sl=entry*(1+SL_PCT)
-        msg=f'{"🟢 LONG" if cand=="LONG" else "🔴 SHORT"}\n{sym} Futures\nEntry: {entry:.8g}\nTP: {tp:.8g} ({TP_PCT*100:.2f}%)\nSL: {sl:.8g} ({SL_PCT*100:.2f}%)\nLeverage: {LEVERAGE}x\nLiquidity: {info["type"]} sweep\nConfirm: {"FVG" if fv else "Retest"} + 5m\nV6.4'
-        tg(msg);state[sym]=time.time();save_state(state)
-        log.info("%s | SIGNAL %s | TP=%.2f%% | cooldown=%ss",sym,cand,TP_PCT*100,COOLDOWN_SECONDS)
-    except Exception as e:log.exception("%s | ERROR | %s",sym,e)
+def send(t):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:return
+    try:requests.post("https://api.telegram.org/bot"+TELEGRAM_TOKEN+"/sendMessage",json={"chat_id":TELEGRAM_CHAT_ID,"text":t},timeout=8)
+    except Exception as e:logging.warning("Telegram error: %s",e)
 
 def main():
-    log.info("=== CRYPTO SCALP BOT V6.4 ===")
-    log.info("TP=%.2f%% | SL=%.2f%% | cooldown=%ss | leverage=%sx",TP_PCT*100,SL_PCT*100,COOLDOWN_SECONDS,LEVERAGE)
+    logging.info("SCALP V6.5 started | CHoCH + FVG + POI")
+    state=load_state()
     while True:
-        for s in SYMBOLS:scan(s)
-        log.info("========== SCAN COMPLETE | sleeping %ss ==========",POLL_SECONDS);time.sleep(POLL_SECONDS)
+        for s in SYMBOLS:
+            s=s.strip()
+            if not s:continue
+            x=signal(s)
+            if not x or time.time()-float(state.get(s,0))<COOLDOWN_SECONDS:continue
+            side,sym,el,eh,sl,tp,rr,why=x
+            icon="🟢 LONG" if side=="LONG" else "🔴 SHORT"
+            msg=(f"{icon}\nV6.5 SCALP — {sym}\n\n"
+                 f"Entry zone: {el:.8g} – {eh:.8g}\nSL: {sl:.8g}\nTP: {tp:.8g}\n"
+                 f"RR: {rr:.2f}\nLeverage: {LEVERAGE}x\n\nCONFIRMATION:\n{why}\n\n"
+                 f"⚠️ Алгоритмічний сигнал, не гарантія результату.")
+            send(msg); logging.info("%s | SIGNAL | RR=%.2f",s,rr)
+            state[s]=time.time(); save_state(state)
+        time.sleep(POLL_SECONDS)
+
 if __name__=="__main__":main()
